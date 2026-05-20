@@ -134,9 +134,17 @@ def create_grant_rate_table(df):
     return grant_stats
 
 
+def _newest_csv_mtime() -> float:
+    """Return the mtime of the newest patente_*.csv so the cache busts on new data."""
+    from pathlib import Path
+    data_dir = Path(__file__).parent.parent / "data"
+    candidates = sorted(data_dir.glob("patente_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0].stat().st_mtime if candidates else 0.0
+
+
 @st.cache_data
-def load_data():
-    """Load patent data with caching."""
+def load_data(csv_mtime: float = 0.0):
+    """Load patent data with caching. Cache busts automatically when a new CSV appears."""
     try:
         df = load_patent_data()
         return df
@@ -982,7 +990,7 @@ def render_detail_table(df):
 def main():
     """Main application entry point."""
     # Load data
-    df = load_data()
+    df = load_data(csv_mtime=_newest_csv_mtime())
     
     if df.empty:
         st.error("No data available. Please check the data file.")
