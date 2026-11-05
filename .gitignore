@@ -8,4 +8,4 @@ data/patente_20260309_1732.csv
 data/patente_20260309_1732.xlsx
 data/patente_20260520_1231.csv
 *.png
-
+data/reviews.sqlite3*

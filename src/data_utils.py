@@ -5,6 +5,7 @@ Data loading, cleaning, and normalization utilities for the patent dashboard.
 import os
 import html
 import warnings
+import re
 import pandas as pd
 from pathlib import Path
 
@@ -138,7 +139,7 @@ def get_project_root():
 
 def load_patent_data(csv_path=None):
     """
-    Load patent data from CSV and perform basic cleaning.
+    Load patent data from available sources and perform basic cleaning.
     
     Args:
         csv_path: Path to CSV file. If None, uses default data location.
@@ -146,20 +147,143 @@ def load_patent_data(csv_path=None):
     Returns:
         DataFrame with cleaned patent data
     """
+    if csv_path is not None:
+        df = load_google_patents_data(csv_path)
+    else:
+        frames = []
+        google_df = load_google_patents_data()
+        if not google_df.empty:
+            frames.append(google_df)
+
+        orbit_df = load_orbit_fampat_data()
+        if not orbit_df.empty:
+            frames.append(orbit_df)
+
+        df = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    # Clean up the data
+    df = _clean_patent_data(df)
+
+    return df
+
+
+def load_google_patents_data(csv_path=None):
+    """Load the newest Google Patents CSV and normalize source metadata."""
     if csv_path is None:
         data_dir = get_project_root() / "data"
-        # Prefer the newest patente_*.csv; fall back to the fixed legacy file
         candidates = sorted(data_dir.glob("patente_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
         fixed = data_dir / "patente_20260309_1732_fixed.csv"
         csv_path = candidates[0] if candidates else fixed
-    
-    # Read CSV with abstract as string to avoid float64 conversion
+
+    if not Path(csv_path).exists():
+        return pd.DataFrame()
+
     df = pd.read_csv(csv_path, encoding='utf-8', dtype={'abstract': str})
-    
-    # Clean up the data
-    df = _clean_patent_data(df)
-    
+    df['source'] = df.get('source', 'Google Patents').fillna('Google Patents')
+    df['record_level'] = 'Patent Publication'
+    if 'publication_date' not in df.columns:
+        df['publication_date'] = pd.NaT
     return df
+
+
+def load_orbit_fampat_data(xlsx_path=None):
+    """Load Orbit/FAMPAT patent-family workbook and map it to dashboard columns."""
+    if xlsx_path is None:
+        xlsx_path = get_project_root() / "data" / "Anlage 1 - KI im Arbeitsschutz_Ergebnisse.xlsx"
+
+    xlsx_path = Path(xlsx_path)
+    if not xlsx_path.exists():
+        return pd.DataFrame()
+
+    raw = pd.read_excel(xlsx_path, sheet_name='Patentfamilie', header=2, engine='openpyxl')
+    raw = raw.dropna(subset=['Number']).copy()
+
+    urls = _extract_orbit_hyperlinks(xlsx_path, row_offset=4, column='C')
+    if urls:
+        raw['_orbit_url'] = urls[:len(raw)]
+    else:
+        raw['_orbit_url'] = raw['Link Patent family/ fulltext']
+
+    marker_map = {
+        'Person': 'marker_person',
+        'Roboter': 'marker_robot',
+        'Maschinelles Lernen / Bildauswertung': 'marker_ml_vision',
+        'Stop': 'marker_stop',
+        'Schutz / Sicherheit': 'marker_safety',
+        'KI': 'marker_ai',
+        'Gefahr': 'marker_hazard',
+        'Industriemaschine': 'marker_industrial_machine',
+        'Kamera': 'marker_camera',
+    }
+
+    df = pd.DataFrame(index=raw.index)
+    df['source'] = 'Orbit/FAMPAT'
+    df['record_level'] = 'Patent Family'
+    df['patent_id'] = raw['Number'].astype(str).str.strip()
+    df['title'] = raw['Title'].apply(_strip_patent_prefix)
+    df['assignee'] = raw['Applicant'].fillna('').astype(str).str.replace('\n', '; ', regex=False).str.strip()
+    df['inventor'] = ''
+    df['publication_date'] = raw['Publ.-\nDate'].apply(_earliest_multiline_date)
+    df['filing_date'] = df['publication_date']
+    df['grant_date'] = pd.NaT
+    df['abstract'] = raw['Abstract'].apply(_strip_patent_prefix)
+    df['url'] = raw['_orbit_url']
+    df['query'] = 'KI im Arbeitsschutz'
+    df['ipc_codes'] = ''
+    df['family_members'] = raw['Doc.numbers\n(closely) family'].fillna('').astype(str).str.strip()
+    df['family_member_count'] = df['family_members'].apply(lambda value: len([item for item in str(value).split('\n') if item.strip()]))
+    df['family_publication_types'] = raw['Type'].fillna('').astype(str).str.strip()
+    df['family_publication_dates'] = raw['Publ.-\nDate'].fillna('').astype(str).str.strip()
+    df['family_legal_status'] = raw['Family legal status'].fillna('').astype(str).str.strip()
+    df['family_legal_state'] = raw['Family legal state'].fillna('').astype(str).str.strip()
+    df['legal_status_detail'] = raw['Legal status (Pending, Granted, Revoked, Expired, Lapsed)'].fillna('').astype(str).str.strip()
+    df['legal_state_detail'] = raw['Legal state (Alive, Dead)'].fillna('').astype(str).str.strip()
+    df['source_comments'] = raw['Comments'].fillna('').astype(str).str.strip()
+
+    for source_col, target_col in marker_map.items():
+        df[target_col] = raw[source_col].fillna(0).astype(str).str.strip().isin(['1', '1.0', 'x', 'X'])
+
+    df['is_granted'] = df['family_legal_status'].eq('GRANTED')
+    return df
+
+
+def _extract_orbit_hyperlinks(xlsx_path, row_offset=4, column='C'):
+    """Extract Orbit/FAMPAT hyperlinks from the family link column."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return []
+
+    workbook = load_workbook(xlsx_path, read_only=False, data_only=True)
+    worksheet = workbook['Patentfamilie']
+    urls = []
+    for row in range(row_offset, worksheet.max_row + 1):
+        cell = worksheet[f'{column}{row}']
+        if cell.hyperlink and cell.hyperlink.target:
+            urls.append(cell.hyperlink.target)
+        else:
+            urls.append(cell.value or '')
+    return urls
+
+
+def _strip_patent_prefix(value):
+    """Remove leading patent-number marker from Orbit title/abstract cells."""
+    if pd.isna(value):
+        return ''
+    text = str(value).strip()
+    return re.sub(r'^\([^)]{2,30}\)\s*', '', text).strip()
+
+
+def _earliest_multiline_date(value):
+    if pd.isna(value):
+        return pd.NaT
+    parts = [part.strip() for part in str(value).split('\n') if part.strip()]
+    dates = pd.to_datetime(parts, errors='coerce')
+    dates = dates[~pd.isna(dates)]
+    return dates.min() if len(dates) else pd.NaT
 
 
 def _clean_patent_data(df):
@@ -175,7 +299,7 @@ def _clean_patent_data(df):
     df = df.copy()
     
     # Convert date columns to datetime
-    for date_col in ['filing_date', 'grant_date']:
+    for date_col in ['filing_date', 'publication_date', 'grant_date']:
         if date_col in df.columns:
             df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
     
@@ -198,8 +322,12 @@ def _clean_patent_data(df):
     # 1. year_filed: extract year from filing_date
     df['year_filed'] = df['filing_date'].dt.year.astype('Int64')  # Use Int64 to allow NaN
     
-    # 2. is_granted: boolean indicating if patent was granted
-    df['is_granted'] = df['grant_date'].notna()
+    # 2. is_granted: boolean indicating if patent/family was granted
+    if 'family_legal_status' in df.columns:
+        family_granted = df['family_legal_status'].astype(str).str.upper().eq('GRANTED')
+        df['is_granted'] = df['grant_date'].notna() | family_granted
+    else:
+        df['is_granted'] = df['grant_date'].notna()
     
     # 3. grant_lag_days: days between filing and grant (NaN if not granted)
     df['grant_lag_days'] = (df['grant_date'] - df['filing_date']).dt.days.astype('Int64')
@@ -781,13 +909,14 @@ def calculate_statistics(df):
     Returns:
         Dictionary with statistics
     """
+    granted_mask = df['is_granted'] if 'is_granted' in df.columns else df['grant_date'].notna()
     stats = {
         'total_patents': len(df),
         'unique_assignees': df['assignee_normalized'].nunique(),
         'unique_inventors': df['inventor'].nunique(),
         'unique_jurisdictions': df['jurisdiction'].nunique(),
-        'patents_with_grants': df['grant_date'].notna().sum(),
-        'patents_pending': df['grant_date'].isna().sum(),
+        'patents_with_grants': granted_mask.sum(),
+        'patents_pending': (~granted_mask).sum(),
     }
     
     # Filing date range

@@ -1,5 +1,5 @@
 """
-Patent Research Dashboard - Interactive Streamlit Application
+Patent Trends Dashboard - Interactive Streamlit Application
 
 A comprehensive dashboard for analyzing patent intelligence on AI components
 with safety functions in machinery, supporting BAuA research.
@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
+import sqlite3
 from collections import Counter
 import re
 
@@ -26,11 +27,12 @@ from data_utils import (
     get_unique_values,
     calculate_statistics,
 )
+from review_store import DECISIONS, init_reviews, load_reviews, save_review
 
 
 # Page configuration
 st.set_page_config(
-    page_title="Patent Intelligence Dashboard",
+    page_title="Patent Trends Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -73,8 +75,14 @@ def extract_keywords_from_titles(df, top_n=20):
     Extract and count keywords from patent titles.
     Removes stopwords and returns top N most common words.
     """
-    stopwords = {'the', 'a', 'an', 'of', 'for', 'in', 'and', 'with', 'to', 'on', 
-                 'by', 'or', 'is', 'at', 'as', 'from', 'that', 'this', 'using', 'based'}
+    stopwords = {
+        'the', 'a', 'an', 'of', 'for', 'in', 'and', 'with', 'to', 'on',
+        'by', 'or', 'is', 'at', 'as', 'from', 'that', 'this', 'using', 'based',
+        'und', 'oder', 'der', 'die', 'das', 'den', 'dem', 'des', 'ein', 'eine',
+        'einer', 'eines', 'einem', 'einen', 'mit', 'für', 'zur', 'zum', 'von',
+        'im', 'in', 'an', 'auf', 'aus', 'bei', 'als', 'durch', 'sowie', 'insbesondere',
+        'verfahren', 'vorrichtung', 'system', 'gerät', 'maschine'
+    }
     
     all_words = []
     for title in df['title'].dropna():
@@ -134,12 +142,12 @@ def create_grant_rate_table(df):
     return grant_stats
 
 
-def _newest_csv_mtime() -> float:
-    """Return the mtime of the newest patente_*.csv so the cache busts on new data."""
+def _newest_data_mtime() -> float:
+    """Return newest data-file mtime so the cache busts on new data."""
     from pathlib import Path
     data_dir = Path(__file__).parent.parent / "data"
-    candidates = sorted(data_dir.glob("patente_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0].stat().st_mtime if candidates else 0.0
+    candidates = list(data_dir.glob("patente_*.csv")) + list(data_dir.glob("*.xlsx"))
+    return max((path.stat().st_mtime for path in candidates), default=0.0)
 
 
 @st.cache_data
@@ -159,6 +167,20 @@ def apply_filters(df):
     st.sidebar.header("🔍 Filters")
     
     filtered_df = df.copy()
+
+    # Record level filter
+    if 'record_level' in df.columns:
+        st.sidebar.subheader("Record Level")
+        record_levels = get_unique_values(df, 'record_level')
+        selected_record_levels = st.sidebar.multiselect(
+            "Select record levels",
+            options=record_levels,
+            default=record_levels,
+            key="record_levels"
+        )
+        filtered_df = filter_by_multi_select(filtered_df, 'record_level', selected_record_levels)
+    else:
+        selected_record_levels = []
     
     # Date range filter
     st.sidebar.subheader("Filing Date Range")
@@ -291,10 +313,68 @@ def apply_filters(df):
             filtered_df = filter_by_multi_select(filtered_df, 'functional_role', selected_roles)
     else:
         selected_roles = []
+
+    if 'family_legal_status' in df.columns:
+        family_status_options = get_unique_values(df[df['family_legal_status'].notna()], 'family_legal_status')
+        if family_status_options:
+            st.sidebar.subheader("Family Legal Status")
+            selected_family_statuses = st.sidebar.multiselect(
+                "Select family statuses",
+                options=family_status_options,
+                key="family_legal_statuses"
+            )
+            if selected_family_statuses:
+                filtered_df = filter_by_multi_select(filtered_df, 'family_legal_status', selected_family_statuses)
+        else:
+            selected_family_statuses = []
+    else:
+        selected_family_statuses = []
+
+    if 'family_legal_state' in df.columns:
+        family_state_options = get_unique_values(df[df['family_legal_state'].notna()], 'family_legal_state')
+        if family_state_options:
+            st.sidebar.subheader("Family Legal State")
+            selected_family_states = st.sidebar.multiselect(
+                "Select family states",
+                options=family_state_options,
+                key="family_legal_states"
+            )
+            if selected_family_states:
+                filtered_df = filter_by_multi_select(filtered_df, 'family_legal_state', selected_family_states)
+        else:
+            selected_family_states = []
+    else:
+        selected_family_states = []
+
+    marker_columns = {
+        'marker_person': 'Person',
+        'marker_robot': 'Roboter',
+        'marker_ml_vision': 'ML/Bildauswertung',
+        'marker_stop': 'Stop',
+        'marker_safety': 'Schutz/Sicherheit',
+        'marker_ai': 'KI',
+        'marker_hazard': 'Gefahr',
+        'marker_industrial_machine': 'Industriemaschine',
+        'marker_camera': 'Kamera',
+    }
+    available_markers = {col: label for col, label in marker_columns.items() if col in df.columns}
+    if available_markers:
+        st.sidebar.subheader("Orbit/FAMPAT Markers")
+        selected_markers = st.sidebar.multiselect(
+            "Require markers",
+            options=list(available_markers.keys()),
+            format_func=lambda col: available_markers[col],
+            key="required_markers"
+        )
+        for marker_col in selected_markers:
+            filtered_df = filtered_df[filtered_df[marker_col].fillna(False)]
+    else:
+        selected_markers = []
     
     return filtered_df, {
         'date_range': date_range if pd.notna(min_date) else None,
         'sources': selected_sources,
+        'record_levels': selected_record_levels,
         'assignees': selected_assignees,
         'jurisdictions': selected_jurisdictions,
         'queries': selected_queries,
@@ -302,6 +382,9 @@ def apply_filters(df):
         'technology_fields': selected_tech_fields,
         'priority_score_range': (score_min, score_max),
         'functional_roles': selected_roles,
+        'family_legal_statuses': selected_family_statuses,
+        'family_legal_states': selected_family_states,
+        'required_markers': selected_markers,
     }
 
 
@@ -309,13 +392,13 @@ def render_header():
     """Render dashboard header with BAuA branding."""
     # BAuA sidebar header
     st.sidebar.markdown(
-        '<div class="baua-header">🔬 AI Safety Patent Dashboard</div>',
+        '<div class="baua-header">🔬 Patent Trends Dashboard</div>',
         unsafe_allow_html=True
     )
     
     col1, col2 = st.columns([3, 1])
     with col1:
-        st.title("📊 Patent Intelligence Dashboard")
+        st.title("📊 Patent Trends Dashboard")
         st.markdown("Interactive analysis of AI patents with safety functions in machinery")
     with col2:
         st.markdown("")
@@ -871,6 +954,237 @@ def render_regulatory_relevance(df):
         )
 
 
+def render_family_intelligence(df):
+    """View: Orbit/FAMPAT family-level status and marker analysis."""
+    st.header("👪 Family Intelligence")
+
+    if 'record_level' not in df.columns:
+        st.info("No patent-family records available.")
+        return
+
+    family_df = df[df['record_level'] == 'Patent Family'].copy()
+    if family_df.empty:
+        st.info("No Orbit/FAMPAT patent-family records match the current filters.")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Patent Families", len(family_df))
+    with col2:
+        st.metric("Alive Families", int((family_df.get('family_legal_state') == 'ALIVE').sum()))
+    with col3:
+        st.metric("Granted Families", int((family_df.get('family_legal_status') == 'GRANTED').sum()))
+    with col4:
+        avg_family_size = family_df['family_member_count'].mean() if 'family_member_count' in family_df.columns else 0
+        st.metric("Avg Family Size", f"{avg_family_size:.1f}")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        status_counts = family_df['family_legal_status'].value_counts().reset_index()
+        status_counts.columns = ['family_legal_status', 'count']
+        fig_status = px.bar(
+            status_counts,
+            x='family_legal_status',
+            y='count',
+            title='Family Legal Status',
+            labels={'family_legal_status': 'Legal Status', 'count': 'Patent Families'},
+            color='count',
+            color_continuous_scale='Blues'
+        )
+        fig_status.update_layout(height=400)
+        st.plotly_chart(fig_status, use_container_width=True)
+
+    with col2:
+        state_counts = family_df['family_legal_state'].value_counts().reset_index()
+        state_counts.columns = ['family_legal_state', 'count']
+        fig_state = px.pie(
+            state_counts,
+            names='family_legal_state',
+            values='count',
+            title='Family Legal State',
+            hole=0.35
+        )
+        fig_state.update_layout(height=400)
+        st.plotly_chart(fig_state, use_container_width=True)
+
+    marker_columns = {
+        'marker_person': 'Person',
+        'marker_robot': 'Roboter',
+        'marker_ml_vision': 'ML/Bildauswertung',
+        'marker_stop': 'Stop',
+        'marker_safety': 'Schutz/Sicherheit',
+        'marker_ai': 'KI',
+        'marker_hazard': 'Gefahr',
+        'marker_industrial_machine': 'Industriemaschine',
+        'marker_camera': 'Kamera',
+    }
+    available_markers = {col: label for col, label in marker_columns.items() if col in family_df.columns}
+    if available_markers:
+        marker_counts = pd.DataFrame([
+            {'Marker': label, 'Count': int(family_df[col].fillna(False).sum())}
+            for col, label in available_markers.items()
+        ]).sort_values('Count', ascending=True)
+        fig_markers = px.bar(
+            marker_counts,
+            x='Count',
+            y='Marker',
+            orientation='h',
+            title='Orbit/FAMPAT Marker Frequency',
+            color='Count',
+            color_continuous_scale='Oranges'
+        )
+        fig_markers.update_layout(height=450)
+        st.plotly_chart(fig_markers, use_container_width=True)
+
+        marker_matrix = family_df[list(available_markers.keys())].fillna(False).astype(int)
+        cooccurrence = marker_matrix.T.dot(marker_matrix)
+        cooccurrence.index = [available_markers[col] for col in cooccurrence.index]
+        cooccurrence.columns = [available_markers[col] for col in cooccurrence.columns]
+        fig_cooccurrence = px.imshow(
+            cooccurrence,
+            title='Marker Co-occurrence',
+            labels=dict(x='Marker', y='Marker', color='Families'),
+            color_continuous_scale='YlOrRd',
+            aspect='auto'
+        )
+        fig_cooccurrence.update_layout(height=550)
+        st.plotly_chart(fig_cooccurrence, use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        top_applicants = family_df['assignee_normalized'].value_counts().head(15).reset_index()
+        top_applicants.columns = ['Applicant', 'Patent Families']
+        st.subheader("Top Applicants")
+        st.dataframe(top_applicants, use_container_width=True, height=420)
+
+    with col2:
+        if 'family_member_count' in family_df.columns:
+            fig_family_size = px.histogram(
+                family_df,
+                x='family_member_count',
+                title='Family Member Count Distribution',
+                labels={'family_member_count': 'Family Members'},
+                nbins=12
+            )
+            fig_family_size.update_layout(height=420)
+            st.plotly_chart(fig_family_size, use_container_width=True)
+
+
+def render_review_queue(df, reviews):
+    """Review source records one at a time and export annotated research results."""
+    st.header("📝 Review Queue")
+    st.caption("Human assessments are saved locally; automated priority scores are screening aids only.")
+
+    # The same publication can appear in multiple search results; review each source record once.
+    records = df.drop_duplicates(subset=['source', 'record_level', 'patent_id']).copy()
+    if records.empty:
+        st.info("No records match the dashboard filters.")
+        return
+
+    def record_key(row):
+        return (str(row['source']), str(row['record_level']), str(row['patent_id']))
+
+    records['review_decision'] = [
+        reviews.get(record_key(row), {}).get('decision', 'Unreviewed')
+        for _, row in records.iterrows()
+    ]
+    records['on_watchlist'] = [
+        bool(reviews.get(record_key(row), {}).get('watchlist', False))
+        for _, row in records.iterrows()
+    ]
+    reviewed = int((records['review_decision'] != 'Unreviewed').sum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Reviewed", reviewed)
+    c2.metric("Remaining", len(records) - reviewed)
+    c3.metric("Relevant", int((records['review_decision'] == 'Relevant').sum()))
+    c4.metric("On Watchlist", int(records['on_watchlist'].sum()))
+    st.progress(reviewed / len(records))
+
+    view = st.radio(
+        "Queue", ['Unreviewed', 'Needs follow-up', 'Relevant', 'Not relevant', 'Watchlist', 'All'],
+        horizontal=True, key='review_queue_view'
+    )
+    search = st.text_input("Find a record", placeholder="Patent ID, title or applicant", key='review_search')
+    queue = records if view == 'All' else records[
+        records['on_watchlist'] if view == 'Watchlist' else records['review_decision'] == view
+    ]
+    if search:
+        mask = (
+            queue['patent_id'].astype(str).str.contains(search, case=False, regex=False, na=False)
+            | queue['title'].astype(str).str.contains(search, case=False, regex=False, na=False)
+            | queue['assignee_normalized'].astype(str).str.contains(search, case=False, regex=False, na=False)
+        )
+        queue = queue[mask]
+    queue = queue.sort_values('patent_priority_score', ascending=False, na_position='last')
+
+    if queue.empty:
+        st.info("No records in this queue. Choose another view or adjust your filters.")
+    else:
+        by_key = {record_key(row): row for _, row in queue.iterrows()}
+        keys = list(by_key)
+        selected = st.selectbox(
+            f"Select record ({len(keys)} results)", keys,
+            format_func=lambda key: f"{key[2]} · {str(by_key[key]['title'])[:75]} · {key[0]} ({key[1]})",
+            key='review_selected'
+        )
+        row = by_key[selected]
+        existing = reviews.get(selected, {})
+
+        st.subheader(str(row['title']))
+        st.caption(f"{row['assignee_normalized']} · {selected[0]} · {selected[1]} · {selected[2]}")
+        if pd.notna(row.get('url')) and str(row['url']).startswith('http'):
+            st.link_button("Open source record", str(row['url']))
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"**Heuristic priority score:** {row.get('patent_priority_score', 'n/a')}")
+            st.write(f"**Score rationale:** {row.get('score_comment', 'n/a')}")
+            st.write(f"**Technology fields:** {row.get('technology_fields', 'n/a')}")
+        with col2:
+            st.write(f"**Jurisdiction:** {row.get('jurisdiction', 'n/a')}")
+            if selected[1] == 'Patent Family':
+                st.write(f"**Family status:** {row.get('family_legal_status', 'n/a')}")
+                st.write(f"**Family state:** {row.get('family_legal_state', 'n/a')}")
+                st.write(f"**Family members:** {row.get('family_members', 'n/a')}")
+            else:
+                st.write(f"**Filing date:** {row.get('filing_date', 'n/a')}")
+        if isinstance(row.get('abstract'), str) and row['abstract'].strip():
+            with st.expander("Abstract"):
+                st.write(row['abstract'])
+
+        with st.form(f"review_form_{selected[0]}_{selected[1]}_{selected[2]}"):
+            decision = st.selectbox("Researcher decision", DECISIONS,
+                                    index=DECISIONS.index(existing.get('decision', 'Unreviewed')))
+            rationale = st.text_area("Rationale / evidence", value=existing.get('rationale', ''))
+            tags = st.text_input("Tags (comma-separated)", value=existing.get('tags', ''))
+            watchlist = st.checkbox("Add to watchlist", value=bool(existing.get('watchlist', False)))
+            next_action = st.text_input("Next action", value=existing.get('next_action', ''))
+            submitted = st.form_submit_button("Save assessment", type='primary')
+        if submitted:
+            save_review(*selected, decision, rationale, tags, watchlist, next_action)
+            st.rerun()
+        def select_next_record():
+            st.session_state['review_selected'] = keys[(keys.index(selected) + 1) % len(keys)]
+
+        st.button("Next record", disabled=len(keys) < 2, on_click=select_next_record)
+        if existing.get('reviewed_at'):
+            st.caption(f"Last reviewed: {existing['reviewed_at']}")
+
+    st.subheader("Export assessments")
+    export = records[['source', 'record_level', 'patent_id', 'title',
+                      'assignee_normalized', 'url', 'patent_priority_score']].copy()
+    for column in ['decision', 'rationale', 'tags', 'watchlist', 'next_action', 'reviewed_at']:
+        export[column] = [reviews.get(record_key(row), {}).get(column, False if column == 'watchlist' else '')
+                          for _, row in records.iterrows()]
+    export['decision'] = export['decision'].replace('', 'Unreviewed')
+    export = export[export['watchlist'].astype(bool) if view == 'Watchlist'
+                    else export['decision'] != 'Unreviewed']
+    st.download_button("Download reviewed records / watchlist (CSV)",
+                       export.to_csv(index=False).encode('utf-8-sig'),
+                       file_name='patent_reviews.csv', mime='text/csv',
+                       disabled=export.empty)
+    st.caption("Export reflects the dashboard filters and the selected queue (watchlist or reviewed records).")
+
+
 def render_detail_table(df):
     """View 5: Detail Table - Searchable with abstract expanders and clickable links."""
     st.header("📋 Patent Details")
@@ -917,7 +1231,7 @@ def render_detail_table(df):
     
     for idx, (_, row) in enumerate(search_df.iterrows()):
         patent_id = row['patent_id']
-        title = row['title']
+        title = str(row['title']) if pd.notna(row['title']) else ''
         assignee = row['assignee_normalized']
         
         # Create expander with patent info
@@ -931,6 +1245,8 @@ def render_detail_table(df):
             with col2:
                 st.write(f"**Grant Date:** {row['grant_date']}")
                 st.write(f"**Source:** {row['source']}")
+                if 'record_level' in row:
+                    st.write(f"**Record Level:** {row.get('record_level', 'n/a')}")
                 st.write(f"**Query:** {row['query']}")
                 if 'patent_priority_score' in row:
                     st.write(f"**Patent Priority Score:** {row['patent_priority_score']}")
@@ -941,7 +1257,33 @@ def render_detail_table(df):
                 
                 # Patent link
                 if 'url' in search_df.columns and pd.notna(row['url']):
-                    st.markdown(f"[🔗 View on Google Patents]({row['url']})")
+                    link_label = "View Patent Family" if row.get('source') == 'Orbit/FAMPAT' else "View on Google Patents"
+                    st.markdown(f"[🔗 {link_label}]({row['url']})")
+
+            if row.get('record_level') == 'Patent Family':
+                st.markdown("---")
+                st.write(f"**Family Legal Status:** {row.get('family_legal_status', 'n/a')}")
+                st.write(f"**Family Legal State:** {row.get('family_legal_state', 'n/a')}")
+                st.write(f"**Family Members:** {row.get('family_member_count', 'n/a')}")
+                if pd.notna(row.get('family_members')) and str(row.get('family_members')).strip():
+                    st.text(str(row.get('family_members')))
+                marker_labels = {
+                    'marker_person': 'Person',
+                    'marker_robot': 'Roboter',
+                    'marker_ml_vision': 'ML/Bildauswertung',
+                    'marker_stop': 'Stop',
+                    'marker_safety': 'Schutz/Sicherheit',
+                    'marker_ai': 'KI',
+                    'marker_hazard': 'Gefahr',
+                    'marker_industrial_machine': 'Industriemaschine',
+                    'marker_camera': 'Kamera',
+                }
+                active_markers = [label for col, label in marker_labels.items() if bool(row.get(col, False))]
+                if active_markers:
+                    st.write(f"**Markers:** {', '.join(active_markers)}")
+                if pd.notna(row.get('legal_status_detail')) and str(row.get('legal_status_detail')).strip():
+                    st.write("**Family legal status detail:**")
+                    st.code(str(row.get('legal_status_detail')), language=None)
 
             if 'technology_fields' in row:
                 st.markdown("---")
@@ -990,10 +1332,17 @@ def render_detail_table(df):
 def main():
     """Main application entry point."""
     # Load data
-    df = load_data(csv_mtime=_newest_csv_mtime())
+    df = load_data(csv_mtime=_newest_data_mtime())
     
     if df.empty:
         st.error("No data available. Please check the data file.")
+        return
+
+    try:
+        init_reviews()
+        reviews = load_reviews()
+    except (OSError, sqlite3.Error) as exc:
+        st.error(f"Cannot open local review database: {exc}")
         return
     
     # Render header
@@ -1006,13 +1355,15 @@ def main():
     if applied_filters['sources'] != list(df['source'].unique()):
         st.sidebar.info(f"Filtered: {len(filtered_df)} of {len(df)} patents")
     
-    # Tab navigation - 8 tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    # Tab navigation
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "📈 Trends",
+        "📝 Review Queue",
         "🏢 Assignees",
         "🌍 Jurisdiction",
         "🔎 Queries",
         "⚖️ Regulation & BAuA",
+        "👪 Family Intelligence",
         "🏆 Competitive Intel",
         "📝 Abstract Intelligence",
         "📋 Details"
@@ -1021,26 +1372,32 @@ def main():
     with tab1:
         render_overview_metrics(filtered_df)
         render_trend_dashboard(filtered_df)
-    
+
     with tab2:
-        render_assignee_landscape(filtered_df)
-    
+        render_review_queue(filtered_df, reviews)
+
     with tab3:
-        render_jurisdiction_analysis(filtered_df)
-    
+        render_assignee_landscape(filtered_df)
+
     with tab4:
-        render_query_performance(filtered_df)
-    
+        render_jurisdiction_analysis(filtered_df)
+
     with tab5:
-        render_regulatory_relevance(filtered_df)
-    
+        render_query_performance(filtered_df)
+
     with tab6:
-        render_competitive_intel(filtered_df)
-    
+        render_regulatory_relevance(filtered_df)
+
     with tab7:
-        render_abstract_intelligence(filtered_df)
-    
+        render_family_intelligence(filtered_df)
+
     with tab8:
+        render_competitive_intel(filtered_df)
+
+    with tab9:
+        render_abstract_intelligence(filtered_df)
+
+    with tab10:
         render_detail_table(filtered_df)
     
     # Footer
@@ -1048,7 +1405,7 @@ def main():
     st.markdown(
         """
         <div style='text-align: center; color: #666; font-size: 0.9em;'>
-            Patent Intelligence Dashboard | Data Source: Google Patents | BAuA Research
+            Patent Trends Dashboard | Data Sources: Google Patents, Orbit/FAMPAT | BAuA Research
         </div>
         """,
         unsafe_allow_html=True
