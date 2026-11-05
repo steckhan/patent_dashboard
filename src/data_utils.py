@@ -202,10 +202,9 @@ def load_orbit_fampat_data(xlsx_path=None):
     raw = raw.dropna(subset=['Number']).copy()
 
     urls = _extract_orbit_hyperlinks(xlsx_path, row_offset=4, column='C')
-    if urls:
-        raw['_orbit_url'] = urls[:len(raw)]
-    else:
-        raw['_orbit_url'] = raw['Link Patent family/ fulltext']
+    raw['_orbit_url'] = pd.Series(raw.index.map(urls), index=raw.index).fillna(
+        raw['Link Patent family/ fulltext']
+    )
 
     marker_map = {
         'Person': 'marker_person',
@@ -259,13 +258,14 @@ def _extract_orbit_hyperlinks(xlsx_path, row_offset=4, column='C'):
 
     workbook = load_workbook(xlsx_path, read_only=False, data_only=True)
     worksheet = workbook['Patentfamilie']
-    urls = []
+    urls = {}
     for row in range(row_offset, worksheet.max_row + 1):
         cell = worksheet[f'{column}{row}']
         if cell.hyperlink and cell.hyperlink.target:
-            urls.append(cell.hyperlink.target)
+            urls[row - row_offset] = cell.hyperlink.target
         else:
-            urls.append(cell.value or '')
+            urls[row - row_offset] = cell.value or ''
+    workbook.close()
     return urls
 
 

@@ -9,7 +9,19 @@ pip install -r requirements.txt
 ```
 
 ## Data
-334 patents (2019–2025) from Google Patents, enriched with abstracts and IPC/CPC codes.
+The dashboard loads the newest `data/patente_*.csv` Google Patents export and
+`data/Anlage 1 - KI im Arbeitsschutz_Ergebnisse.xlsx` (the `Patentfamilie` sheet)
+automatically. The current files contain 334 Google Patents publications and 135
+Orbit/FAMPAT patent families. Use the **Source** or **Record Level** sidebar filters
+to view either source, and the family analysis tab to explore legal status and markers.
+
+Publications and families are different record levels and can overlap; combined counts
+are not counts of unique inventions. For Orbit/FAMPAT records, the earliest family
+publication date is used as a proxy for the filing date because the workbook does not
+provide one. Filing-year charts and filters therefore use that proxy for these records.
+The keyword-based relevance scores are primarily English-language heuristics and may
+underestimate German-language workbook records; the workbook markers remain available
+for filtering and expert review.
 
 ## Scoring
 Patents are scored across 6 dimensions: AI relevance, safety relevance, machine reference, safety function, regulatory relevance, and BAuA fit — using both keyword matching and IPC code lookups.
